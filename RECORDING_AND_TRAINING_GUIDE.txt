@@ -1,0 +1,140 @@
+================================================================
+  DRIVER STATE CLASSIFIER - RECORDING & TRAINING GUIDE
+================================================================
+
+
+----------------------------------------------------------------
+  PART 1: HOW MANY VIDEOS AND HOW LONG
+----------------------------------------------------------------
+
+Classes (6 total):
+  - Alert ✔️
+  - Drowsy ✔️
+  - Sleeping 
+  - Singing
+  - Distracted 
+  - Yawning ✔️
+
+Videos per class:    8-10 videos
+Video length:        15-20 seconds each
+Camera angle:        Frontal or slightly below eye level (like a dashcam)
+Camera distance:     50-60 cm from face
+
+Total videos needed: ~56-70 videos (8-10 per class x 7 classes)
+
+
+RECOMMENDED RECORDING PLAN:
+  - Film with 4 different people
+  - Each person records 2 clips per class
+  - 4 people x 2 clips x 7 classes = 56 videos total
+
+
+WHAT TO DO IN EACH CLASS:
+
+  Alert      - Look forward naturally, normal blink rate, relaxed posture
+  Drowsy     - Heavy eyelids, slow blinks, slight head drooping, act tired
+  Sleeping   - Eyes fully closed and still for the entire clip (no peeking)
+  Singing    - Mouth moving animatedly, like singing along to music
+  Distracted - Look left, right, down at phone, away from the "road"
+  Yawning    - Do 2-3 natural yawns per clip (make clips 20-25 sec for this class)
+
+
+TIPS:
+  - Film in different lighting conditions (bright, dim, one-sided light)
+  - Some people with glasses, some without
+  - Sit as if you are in a car (not lying down)
+  - Keep your face clearly visible at all times
+  - Avoid extreme side profiles - MediaPipe needs to see your full face
+
+
+----------------------------------------------------------------
+  PART 2: FOLDER STRUCTURE BEFORE TRAINING
+----------------------------------------------------------------
+
+Put your videos in this exact structure inside the project folder:
+
+  driver-state-classifier/
+    data/
+      raw_videos/
+        Alert/          <- put all Alert videos here
+        Drowsy/         <- put all Drowsy videos here
+        Sleeping/       <- put all Sleeping videos here
+        Singing/        <- put all Singing videos here
+        Distracted/     <- put all Distracted videos here
+        Yawning/        <- put all Yawning videos here
+
+IMPORTANT:
+  - Folder names must match exactly (capital first letter)
+  - Accepted video formats: .mp4, .avi, .mov, .mkv
+  - Name your files anything you want (e.g. alert_person1.mp4)
+
+
+----------------------------------------------------------------
+  PART 3: HOW TO TRAIN THE MODEL
+----------------------------------------------------------------
+
+Open a terminal and go to the project folder:
+
+  cd /home/sahar/Desktop/driver-state-classifier
+
+
+STEP 1 - Install dependencies (run once):
+
+  pip install torch mediapipe opencv-python numpy matplotlib
+
+
+STEP 2 - Preprocess videos (extract EAR/MAR features):
+
+  python src/preprocess.py
+
+  This reads every video, runs face detection on each frame,
+  and saves the features to data/processed/
+  You will see progress printed for each video.
+
+
+STEP 3 - Train the model:
+
+  python train.py --epochs 30 --batch-size 32 --lr 0.001
+
+  This trains the LSTM, prints loss and accuracy each epoch,
+  and saves the best model to models/best_model.pth
+  A learning curve plot is saved to models/training_curves.png
+
+
+----------------------------------------------------------------
+  WHAT TO EXPECT DURING TRAINING
+----------------------------------------------------------------
+
+You should see output like this:
+
+  Epoch  1/30 | train loss 1.7823 acc 0.201 | val loss 1.7541 acc 0.215
+  Epoch  2/30 | train loss 1.5211 acc 0.341 | val loss 1.4892 acc 0.378
+  ...
+  Epoch 30/30 | train loss 0.3102 acc 0.891 | val loss 0.4210 acc 0.847
+
+  Best accuracy: 0.863  ->  saved to models/best_model.pth
+
+Loss should decrease and accuracy should increase over epochs.
+
+
+----------------------------------------------------------------
+  COMMON ERRORS AND FIXES
+----------------------------------------------------------------
+
+  ERROR: "Raw videos folder not found"
+  FIX:   Check your folder structure in Part 2 above
+
+  ERROR: "only N frames (< 30); skipping"
+  FIX:   That video is too short - re-record it longer
+
+  ERROR: "No module named mediapipe"
+  FIX:   Run the pip install command in Step 1 again
+
+  ERROR: Training accuracy stays flat after 5+ epochs
+  FIX:   Check that your videos are genuinely different per class,
+         re-check folder names match exactly
+
+  NOTE:  If you don't have a GPU, training runs on CPU - that is
+         fine, just slightly slower (a few extra minutes)
+
+================================================================
