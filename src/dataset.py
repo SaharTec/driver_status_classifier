@@ -15,7 +15,10 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-from config import (PROCESSED_DIR, LABELS_FILE, SEQUENCE_LENGTH, NUM_FEATURES)
+# --- previous version (kept so we can restore the no-exclude setup) ---
+# from config import (PROCESSED_DIR, LABELS_FILE, SEQUENCE_LENGTH, NUM_FEATURES)
+from config import (PROCESSED_DIR, LABELS_FILE, SEQUENCE_LENGTH, NUM_FEATURES,
+                    CLASSES, CLASS_TO_IDX, NUM_CLASSES)
 
 
 def _load_entries():
@@ -66,14 +69,48 @@ class DrowsinessDataset(Dataset):
         return x, y
 
 
-def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42):
+# --- previous version (no class filtering) -------------------------------
+# def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42):
+#     """
+#     Split videos into train/val, build sliding-window datasets and return
+#     (train_loader, val_loader).
+#     """
+#     entries = _load_entries()
+#     if not entries:
+#         raise RuntimeError("No usable videos found in data/processed.")
+#
+#     random.seed(seed)
+#     random.shuffle(entries)
+# -------------------------------------------------------------------------
+def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42, exclude=None):
     """
     Split videos into train/val, build sliding-window datasets and return
-    (train_loader, val_loader).
+    (train_loader, val_loader, class_names).
+
+    `exclude` is an optional list of class names (e.g. ["Sleeping", "Distracted"])
+    whose videos are dropped. The remaining labels are remapped to a contiguous
+    0..K-1 range so the loss and the model's output layer stay aligned.
+    `class_names` is the kept classes in their new index order.
     """
     entries = _load_entries()
     if not entries:
         raise RuntimeError("No usable videos found in data/processed.")
+
+    if exclude:
+        unknown = [c for c in exclude if c not in CLASS_TO_IDX]
+        if unknown:
+            raise ValueError(f"Unknown class name(s) to exclude: {unknown}. "
+                             f"Valid classes: {CLASSES}")
+        excluded_idx = {CLASS_TO_IDX[c] for c in exclude}
+        kept_idx = [i for i in range(NUM_CLASSES) if i not in excluded_idx]
+        remap = {old: new for new, old in enumerate(kept_idx)}  # old label -> new label
+        entries = [(arr, remap[lbl]) for arr, lbl in entries if lbl not in excluded_idx]
+        class_names = [CLASSES[i] for i in kept_idx]
+        if not entries:
+            raise RuntimeError("No videos left after applying --exclude.")
+        print(f"Excluding {sorted(exclude)} -> training on {class_names}")
+    else:
+        class_names = list(CLASSES)
 
     random.seed(seed)
     random.shuffle(entries)
@@ -93,11 +130,15 @@ def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42):
     print(f"Videos: {len(train_entries)} train / {len(val_entries)} val")
     print(f"Windows: {len(train_ds)} train"
           + (f" / {len(val_ds)} val" if val_loader else ""))
-    return train_loader, val_loader
+    # --- previous version -------------------------------------------------
+    # return train_loader, val_loader
+    # ----------------------------------------------------------------------
+    return train_loader, val_loader, class_names
 
 
 if __name__ == "__main__":
     # Quick self-test
-    tr, va = make_dataloaders(batch_size=8)
+    # --- previous version: tr, va = make_dataloaders(batch_size=8) ---
+    tr, va, names = make_dataloaders(batch_size=8)
     xb, yb = next(iter(tr))
     print("batch x:", xb.shape, "batch y:", yb.shape, "labels:", yb.tolist())
