@@ -58,11 +58,13 @@ def load_model(device):
     if ih is None:
         raise RuntimeError("Unexpected checkpoint format - missing lstm weights.")
     hidden_size = ih.shape[0] // 4
+    num_classes = state["fc.weight"].shape[0]  # handles models trained with --exclude
 
-    model = DrowsinessLSTM(hidden_size=hidden_size).to(device)
+    model = DrowsinessLSTM(hidden_size=hidden_size, num_classes=num_classes).to(device)
     model.load_state_dict(state)
     model.eval()
-    print(f"Loaded model from {weights_path}  (hidden_size={hidden_size})")
+    print(f"Loaded model from {weights_path}  "
+          f"(hidden_size={hidden_size}, num_classes={num_classes})")
     return model
 
 

@@ -64,7 +64,7 @@ class DrowsinessDataset(Dataset):
     def __getitem__(self, idx):
         v_idx, start = self.samples[idx]
         window = self.arrays[v_idx][start:start + self.seq_len]
-        x = torch.from_numpy(window)                       # (seq_len, 2)
+        x = torch.from_numpy(window)                       # (seq_len, NUM_FEATURES)
         y = torch.tensor(self.video_labels[v_idx], dtype=torch.long)
         return x, y
 
