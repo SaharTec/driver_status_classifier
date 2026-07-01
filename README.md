@@ -15,7 +15,6 @@ The model predicts one of 6 driver states:
 |--------------|-------------------------------------------|----------------|
 | `Alert`      | Awake, engaged, looking forward           | Safe           |
 | `Singing`    | Talking / singing along, mouth moving     | Safe           |
-| `Distracted` | Looking away (phone, side, down)          | Neutral        |
 | `Drowsy`     | Heavy eyelids, slow blinks, head drooping | **Danger**     |
 | `Sleeping`   | Eyes fully closed                         | **Danger**     |
 | `Yawning`    | Yawning                                   | **Danger**     |
@@ -74,7 +73,6 @@ data/raw_videos/
 ├── Drowsy/
 ├── Sleeping/
 ├── Singing/
-├── Distracted/
 └── Yawning/
 ```
 

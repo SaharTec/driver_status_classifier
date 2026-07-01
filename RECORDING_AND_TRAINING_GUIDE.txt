@@ -7,12 +7,11 @@
   PART 1: HOW MANY VIDEOS AND HOW LONG
 ----------------------------------------------------------------
 
-Classes (6 total):
+Classes (5 total):
   - Alert ✔️
   - Drowsy ✔️
-  - Sleeping 
+  - Sleeping
   - Singing
-  - Distracted 
   - Yawning ✔️
 
 Videos per class:    8-10 videos
@@ -20,23 +19,22 @@ Video length:        15-20 seconds each
 Camera angle:        Frontal or slightly below eye level (like a dashcam)
 Camera distance:     50-60 cm from face
 
-Total videos needed: ~56-70 videos (8-10 per class x 7 classes)
+Total videos needed: ~40-50 videos (8-10 per class x 5 classes)
 
 
 RECOMMENDED RECORDING PLAN:
   - Film with 4 different people
   - Each person records 2 clips per class
-  - 4 people x 2 clips x 7 classes = 56 videos total
+  - 4 people x 2 clips x 5 classes = 40 videos total
 
 
 WHAT TO DO IN EACH CLASS:
 
-  Alert      - Look forward naturally, normal blink rate, relaxed posture
-  Drowsy     - Heavy eyelids, slow blinks, slight head drooping, act tired
-  Sleeping   - Eyes fully closed and still for the entire clip (no peeking)
-  Singing    - Mouth moving animatedly, like singing along to music
-  Distracted - Look left, right, down at phone, away from the "road"
-  Yawning    - Do 2-3 natural yawns per clip (make clips 20-25 sec for this class)
+  Alert    - Look forward naturally, normal blink rate, relaxed posture
+  Drowsy   - Heavy eyelids, slow blinks, slight head drooping, act tired
+  Sleeping - Eyes fully closed and still for the entire clip (no peeking)
+  Singing  - Mouth moving animatedly, like singing along to music
+  Yawning  - Do 2-3 natural yawns per clip (make clips 20-25 sec for this class)
 
 
 TIPS:
@@ -60,7 +58,6 @@ Put your videos in this exact structure inside the project folder:
         Drowsy/         <- put all Drowsy videos here
         Sleeping/       <- put all Sleeping videos here
         Singing/        <- put all Singing videos here
-        Distracted/     <- put all Distracted videos here
         Yawning/        <- put all Yawning videos here
 
 IMPORTANT:

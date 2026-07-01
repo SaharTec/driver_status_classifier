@@ -18,7 +18,7 @@ LABELS_FILE = PROCESSED_DIR / "labels.json"
 # Classes - the index in this list IS the label used for training.
 # Do not reorder once you have trained a model.
 # ---------------------------------------------------------------------------
-CLASSES = ["Alert", "Drowsy", "Sleeping", "Singing", "Distracted", "Yawning"]
+CLASSES = ["Alert", "Drowsy", "Sleeping", "Singing", "Yawning"]
 CLASS_TO_IDX = {name: i for i, name in enumerate(CLASSES)}
 NUM_CLASSES = len(CLASSES)
 
@@ -31,16 +31,22 @@ NUM_CLASSES = len(CLASSES)
 # ---------------------------------------------------------------------------
 ALERT_CLASSES = ["Alert", "Singing"]              # talking / singing / awake
 DANGER_CLASSES = ["Drowsy", "Sleeping", "Yawning"]  # the states that trigger sound
-NEUTRAL_CLASSES = ["Distracted"]                   # looked away, but not drowsy
 
 # Folder that holds the alarm recordings (.wav). Missing files fall back to a beep.
 ALERTS_DIR = ROOT / "alerts"
 
+# MediaPipe Tasks model (auto-downloaded on first run)
+FACE_LANDMARKER_MODEL = MODELS_DIR / "face_landmarker.task"
+FACE_LANDMARKER_URL = (
+    "https://storage.googleapis.com/mediapipe-models/"
+    "face_landmarker/face_landmarker/float16/1/face_landmarker.task"
+)
+
 # ---------------------------------------------------------------------------
 # Sequence / feature settings
 # ---------------------------------------------------------------------------
-SEQUENCE_LENGTH = 30   # frames per sample (~1 second at 30 fps)
-NUM_FEATURES = 5       # [EAR, MAR, yaw, pitch, roll]
+SEQUENCE_LENGTH = 60   # frames per sample (~2 seconds at 30 fps)
+NUM_FEATURES = 7       # [EAR, MAR, yaw, pitch, roll, Δ_EAR, Δ_MAR]
 
 # ---------------------------------------------------------------------------
 # MediaPipe FaceMesh landmark indices (same ones used in the original main.py)

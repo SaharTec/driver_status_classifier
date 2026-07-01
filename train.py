@@ -24,14 +24,14 @@ import matplotlib.pyplot as plt
 # make the modules in src/ importable
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
-from config import MODELS_DIR, NUM_CLASSES         # noqa: E402
+from config import MODELS_DIR, NUM_CLASSES, NUM_FEATURES  # noqa: E402
 from dataset import make_dataloaders               # noqa: E402
-from model import DrowsinessLSTM                    # noqa: E402
+from model import DrowsinessLSTM, DrowsinessTCN    # noqa: E402
 
 
 # --- previous version (hard-wired to NUM_CLASSES) ------------------------
 # def compute_class_weights(loader, device):
-#     """Inverse-frequency weights so rare classes (Sleeping, Distracted) count
+#     """Inverse-frequency weights so rare classes (e.g. Sleeping) count
 #     as much as the common ones. Returns a (NUM_CLASSES,) tensor for the loss."""
 #     ds = loader.dataset
 #     labels = [ds.video_labels[v_idx] for v_idx, _ in ds.samples]
@@ -80,14 +80,21 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--hidden-size", type=int, default=64)
+    parser.add_argument("--model", choices=["lstm", "tcn"], default="lstm",
+                        help="model architecture: lstm (default) or tcn")
+    parser.add_argument("--hidden-size", type=int, default=128)
+    parser.add_argument("--num-layers", type=int, default=2,
+                        help="number of stacked LSTM layers (default 2, lstm only)")
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--patience", type=int, default=7,
                         help="stop after this many epochs without val_loss improvement")
     parser.add_argument("--exclude", nargs="+", default=None,
                         metavar="CLASS",
                         help="class names whose videos are dropped from training, "
-                             "e.g. --exclude Sleeping Distracted")
+                             "e.g. --exclude Sleeping")
+    parser.add_argument("--merge", nargs=2, default=None,
+                        metavar=("SRC", "DST"),
+                        help="merge SRC class into DST, e.g. --merge Sleeping Drowsy")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -101,15 +108,23 @@ def main():
     # class_weights = compute_class_weights(train_loader, device)
     # --------------------------------------------------------------------
     train_loader, val_loader, class_names = make_dataloaders(
-        batch_size=args.batch_size, stride=args.stride, exclude=args.exclude)
+        batch_size=args.batch_size, stride=args.stride,
+        exclude=args.exclude, merge=tuple(args.merge) if args.merge else None)
     num_classes = len(class_names)
 
-    model = DrowsinessLSTM(hidden_size=args.hidden_size,
-                           num_classes=num_classes).to(device)
+    if args.model == "tcn":
+        model = DrowsinessTCN(num_classes=num_classes).to(device)
+    else:
+        model = DrowsinessLSTM(hidden_size=args.hidden_size,
+                               num_layers=args.num_layers,
+                               num_classes=num_classes).to(device)
+    print(f"Architecture: {args.model.upper()}")
     class_weights = compute_class_weights(train_loader, device, num_classes)
     print("Class weights:", [round(w, 2) for w in class_weights.tolist()])
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=5e-4)
+    scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-5)
 
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
     best_path = MODELS_DIR / "best_model.pth"
@@ -138,6 +153,7 @@ def main():
             current_loss = tr_loss
 
         print(msg)
+        scheduler.step(current_loss)
 
         # Save the model with the lowest val_loss, and stop once it stops
         # improving for `patience` epochs (so we keep the best-generalizing
@@ -145,7 +161,13 @@ def main():
         if current_loss < best_val_loss - 1e-4:
             best_val_loss = current_loss
             epochs_no_improve = 0
-            torch.save(model.state_dict(), best_path)
+            ckpt = {"model_type": args.model, "class_names": class_names,
+                    "num_features": NUM_FEATURES,
+                    "state_dict": model.state_dict()}
+            if args.model == "lstm":
+                ckpt.update({"hidden_size": args.hidden_size,
+                             "num_layers": args.num_layers})
+            torch.save(ckpt, best_path)
             print(f"        saved (best val loss {best_val_loss:.4f})")
         else:
             epochs_no_improve += 1

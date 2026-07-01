@@ -16,7 +16,7 @@ Examples
 python src/youtube_clips.py "https://youtu.be/VIDEO" --label Dazzled
 
 # Only the parts where the behavior actually happens
-python src/youtube_clips.py "https://youtu.be/VIDEO" --label Distracted \
+python src/youtube_clips.py "https://youtu.be/VIDEO" --label Drowsy \
         --range 0:30-1:10 --range 2:05-2:50
 
 # Different clip length (Yawning guide wants 20-25s)

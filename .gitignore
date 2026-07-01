@@ -13,3 +13,7 @@ data/
 *.webm
 *.flv
 *.wmv
+
+# Large binary model files (re-download or re-train locally)
+*.task
+models/training_curves.png

@@ -9,22 +9,51 @@ pitch = head rotation up/down      (normalized to ~[-1, 1])
 roll  = head tilt clockwise/ccw    (normalized to ~[-1, 1])
 
 Head pose lets the model distinguish classes that look identical in EAR/MAR
-alone, e.g. Alert vs Distracted (Distracted = head turned sideways).
+alone (e.g. head tilt during Drowsy vs Alert).
 
 This logic is the same maths as the original main.py, refactored so both the
 preprocessing script and a real-time demo can reuse it.
 """
+import urllib.request
+
 import cv2
 import numpy as np
 import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
 
 from config import (RIGHT_EYE_INDICES, LEFT_EYE_INDICES, MOUTH_INDICES,
-                    HEAD_POSE_LANDMARKS, HEAD_POSE_3D_MODEL)
+                    HEAD_POSE_LANDMARKS, HEAD_POSE_3D_MODEL,
+                    FACE_LANDMARKER_MODEL, FACE_LANDMARKER_URL)
+
+
+def _ensure_model():
+    """Download face_landmarker.task on first use."""
+    if not FACE_LANDMARKER_MODEL.exists():
+        print(f"Downloading face_landmarker.task to {FACE_LANDMARKER_MODEL} ...")
+        FACE_LANDMARKER_MODEL.parent.mkdir(parents=True, exist_ok=True)
+        urllib.request.urlretrieve(FACE_LANDMARKER_URL, FACE_LANDMARKER_MODEL)
+        print("Download complete.")
+
+
+def make_face_detector():
+    """Create and return a MediaPipe FaceLandmarker (Tasks API)."""
+    _ensure_model()
+    base_options = mp_python.BaseOptions(
+        model_asset_path=str(FACE_LANDMARKER_MODEL))
+    options = mp_vision.FaceLandmarkerOptions(
+        base_options=base_options,
+        num_faces=1,
+        min_face_detection_confidence=0.5,
+        min_face_presence_confidence=0.5,
+        min_tracking_confidence=0.5,
+    )
+    return mp_vision.FaceLandmarker.create_from_options(options)
 
 
 def _get_coords(landmarks, indices, img_w, img_h):
     return np.array(
-        [[landmarks.landmark[i].x * img_w, landmarks.landmark[i].y * img_h]
+        [[landmarks[i].x * img_w, landmarks[i].y * img_h]
          for i in indices]
     )
 
@@ -55,13 +84,11 @@ def compute_head_pose(face_landmarks, img_w, img_h):
     Return (yaw, pitch, roll) for a single detected face, normalized to
     roughly [-1, 1] so they have a similar scale to EAR/MAR.
 
-    Uses cv2.solvePnP against a generic 3D face model. The camera matrix
-    is approximated from the image size (focal length = image width,
-    principal point = image centre) which is the standard cheap default.
+    Uses cv2.solvePnP against a generic 3D face model.
     """
     image_points = np.array(
-        [[face_landmarks.landmark[i].x * img_w,
-          face_landmarks.landmark[i].y * img_h]
+        [[face_landmarks[i].x * img_w,
+          face_landmarks[i].y * img_h]
          for i in HEAD_POSE_LANDMARKS],
         dtype=np.float64,
     )
@@ -110,20 +137,13 @@ def extract_features_from_video(video_path, verbose=False):
     Process one video file and return a float32 array of shape (num_frames, 5).
 
     Frames where no face is detected reuse the previous valid value
-    (forward-fill), or zeros if no face has been seen yet. This avoids the
-    sharp zero-spikes that the original script produced on missed detections.
+    (forward-fill), or zeros if no face has been seen yet.
     """
-    mp_face_mesh = mp.solutions.face_mesh
-    face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    detector = make_face_detector()
 
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
-        face_mesh.close()
+        detector.close()
         raise IOError(f"Could not open video: {video_path}")
 
     features = []
@@ -137,11 +157,12 @@ def extract_features_from_video(video_path, verbose=False):
 
         img_h, img_w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = detector.detect(mp_image)
 
-        if results.multi_face_landmarks:
+        if result.face_landmarks:
             last_valid = compute_all_features(
-                results.multi_face_landmarks[0], img_w, img_h)
+                result.face_landmarks[0], img_w, img_h)
 
         features.append(list(last_valid))
         frame_count += 1
@@ -149,5 +170,5 @@ def extract_features_from_video(video_path, verbose=False):
             print(f"    processed {frame_count} frames...")
 
     cap.release()
-    face_mesh.close()
+    detector.close()
     return np.asarray(features, dtype=np.float32)

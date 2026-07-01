@@ -47,8 +47,9 @@ class DrowsinessDataset(Dataset):
         y : LongTensor scalar (the class index)
     """
 
-    def __init__(self, entries, seq_len=SEQUENCE_LENGTH, stride=1):
+    def __init__(self, entries, seq_len=SEQUENCE_LENGTH, stride=1, augment=False):
         self.seq_len = seq_len
+        self.augment = augment
         self.samples = []  # list of (video_idx, start_frame)
         self.arrays = [arr for arr, _ in entries]
         self.video_labels = [lbl for _, lbl in entries]
@@ -63,8 +64,13 @@ class DrowsinessDataset(Dataset):
 
     def __getitem__(self, idx):
         v_idx, start = self.samples[idx]
-        window = self.arrays[v_idx][start:start + self.seq_len]
-        x = torch.from_numpy(window)                       # (seq_len, NUM_FEATURES)
+        window = self.arrays[v_idx][start:start + self.seq_len].copy()  # (seq_len, 5)
+        if self.augment:
+            window += np.random.normal(0, 0.01, window.shape).astype(np.float32)
+        delta = np.zeros((self.seq_len, 2), dtype=np.float32)
+        delta[1:] = window[1:, :2] - window[:-1, :2]
+        window = np.concatenate([window, delta], axis=1)         # (seq_len, 7)
+        x = torch.from_numpy(window)                             # (seq_len, NUM_FEATURES)
         y = torch.tensor(self.video_labels[v_idx], dtype=torch.long)
         return x, y
 
@@ -82,28 +88,43 @@ class DrowsinessDataset(Dataset):
 #     random.seed(seed)
 #     random.shuffle(entries)
 # -------------------------------------------------------------------------
-def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42, exclude=None):
+def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42,
+                     exclude=None, merge=None):
     """
     Split videos into train/val, build sliding-window datasets and return
     (train_loader, val_loader, class_names).
 
-    `exclude` is an optional list of class names (e.g. ["Sleeping", "Distracted"])
-    whose videos are dropped. The remaining labels are remapped to a contiguous
-    0..K-1 range so the loss and the model's output layer stay aligned.
-    `class_names` is the kept classes in their new index order.
+    `exclude`: list of class names to drop entirely (e.g. ["Sleeping"]).
+    `merge`:   (src, dst) tuple — all src videos are relabelled as dst
+               (e.g. ("Sleeping", "Drowsy")). src disappears as a separate class.
+    Labels are always remapped to a contiguous 0..K-1 range.
     """
     entries = _load_entries()
     if not entries:
         raise RuntimeError("No usable videos found in data/processed.")
 
-    if exclude:
+    if merge:
+        src_name, dst_name = merge
+        for name in (src_name, dst_name):
+            if name not in CLASS_TO_IDX:
+                raise ValueError(f"Unknown class '{name}'. Valid: {CLASSES}")
+        src_idx = CLASS_TO_IDX[src_name]
+        dst_idx = CLASS_TO_IDX[dst_name]
+        raw_map = list(range(NUM_CLASSES))
+        raw_map[src_idx] = dst_idx          # src → dst
+        remaining = sorted(set(raw_map))
+        compact = {old: new for new, old in enumerate(remaining)}
+        entries = [(arr, compact[raw_map[lbl]]) for arr, lbl in entries]
+        class_names = [CLASSES[i] for i in remaining]
+        print(f"Merging '{src_name}' -> '{dst_name}': training on {class_names}")
+    elif exclude:
         unknown = [c for c in exclude if c not in CLASS_TO_IDX]
         if unknown:
             raise ValueError(f"Unknown class name(s) to exclude: {unknown}. "
                              f"Valid classes: {CLASSES}")
         excluded_idx = {CLASS_TO_IDX[c] for c in exclude}
         kept_idx = [i for i in range(NUM_CLASSES) if i not in excluded_idx]
-        remap = {old: new for new, old in enumerate(kept_idx)}  # old label -> new label
+        remap = {old: new for new, old in enumerate(kept_idx)}
         entries = [(arr, remap[lbl]) for arr, lbl in entries if lbl not in excluded_idx]
         class_names = [CLASSES[i] for i in kept_idx]
         if not entries:
@@ -119,7 +140,7 @@ def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42, exclude=No
     val_entries = entries[:n_val]
     train_entries = entries[n_val:]
 
-    train_ds = DrowsinessDataset(train_entries, stride=stride)
+    train_ds = DrowsinessDataset(train_entries, stride=stride, augment=True)
     train_loader = DataLoader(train_ds, batch_size=batch_size, shuffle=True)
 
     val_loader = None

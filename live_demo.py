@@ -32,17 +32,18 @@ import mediapipe as mp
 sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 from config import (RIGHT_EYE_INDICES, LEFT_EYE_INDICES, MOUTH_INDICES,
-                    SEQUENCE_LENGTH, NUM_FEATURES, CLASSES, MODELS_DIR)
-from features import compute_ear_mar, compute_head_pose
-from model import DrowsinessLSTM
+                    SEQUENCE_LENGTH, CLASSES, MODELS_DIR)
+from features import compute_ear_mar, compute_head_pose, make_face_detector
+from model import DrowsinessLSTM, DrowsinessTCN
 from alerts import AlertSystem
 
 
 def load_model(device):
-    """Load best_model.pth into a DrowsinessLSTM. Returns (model, hidden_size).
+    """Load best_model.pth. Returns (model, class_names).
 
-    We don't store the hidden size with the weights, so we try a few common
-    values until one loads. If none works, raise.
+    Handles two checkpoint formats:
+    - New (dict):  {"model_type": "lstm"|"tcn", "state_dict": ..., "class_names": [...], ...}
+    - Legacy (bare state_dict): old LSTM checkpoints saved before the --model flag.
     """
     weights_path = MODELS_DIR / "best_model.pth"
     if not weights_path.exists():
@@ -51,38 +52,50 @@ def load_model(device):
             "'python train.py ...'"
         )
 
-    state = torch.load(weights_path, map_location=device)
-    # infer hidden size from the LSTM weight matrix shape:
-    # lstm.weight_ih_l0 has shape (4 * hidden_size, input_size)
-    ih = state.get("lstm.weight_ih_l0")
-    if ih is None:
-        raise RuntimeError("Unexpected checkpoint format - missing lstm weights.")
-    hidden_size = ih.shape[0] // 4
-    num_classes = state["fc.weight"].shape[0]  # handles models trained with --exclude
+    raw = torch.load(weights_path, map_location=device)
 
-    model = DrowsinessLSTM(hidden_size=hidden_size, num_classes=num_classes).to(device)
+    if isinstance(raw, dict) and "model_type" in raw:
+        model_type = raw["model_type"]
+        state = raw["state_dict"]
+        class_names = raw.get("class_names", list(CLASSES))
+        num_classes = len(class_names)
+        num_features = raw.get("num_features", 7)  # default 7 for older checkpoints
+
+        if model_type == "tcn":
+            model = DrowsinessTCN(input_size=num_features, num_classes=num_classes).to(device)
+        else:
+            hidden_size = raw.get("hidden_size", 128)
+            num_layers = raw.get("num_layers", 2)
+            model = DrowsinessLSTM(input_size=num_features, hidden_size=hidden_size,
+                                   num_layers=num_layers, num_classes=num_classes).to(device)
+    else:
+        # Legacy bare state_dict — infer LSTM config from weight shapes
+        state = raw
+        ih = state.get("lstm.weight_ih_l0")
+        if ih is None:
+            raise RuntimeError("Unexpected checkpoint format — missing lstm weights.")
+        hidden_size = ih.shape[0] // 4
+        num_features = ih.shape[1]   # infer from weight matrix, not from config
+        num_classes = state["fc.weight"].shape[0]
+        num_layers = sum(1 for k in state if k.startswith("lstm.weight_ih_l"))
+        model = DrowsinessLSTM(input_size=num_features, hidden_size=hidden_size,
+                               num_layers=num_layers, num_classes=num_classes).to(device)
+        model_type = "lstm"
+        class_names = list(CLASSES)
+
     model.load_state_dict(state)
     model.eval()
-    print(f"Loaded model from {weights_path}  "
-          f"(hidden_size={hidden_size}, num_classes={num_classes})")
-    return model
+    print(f"Loaded {model_type.upper()} from {weights_path}  "
+          f"(num_classes={num_classes}, classes={class_names})")
+    return model, class_names
 
 
 def main(camera_index=0):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
-    model = load_model(device)
+    model, class_names = load_model(device)
 
-    mp_face_mesh = mp.solutions.face_mesh
-    mp_draw = mp.solutions.drawing_utils
-    mp_styles = mp.solutions.drawing_styles
-
-    face_mesh = mp_face_mesh.FaceMesh(
-        max_num_faces=1,
-        refine_landmarks=True,
-        min_detection_confidence=0.5,
-        min_tracking_confidence=0.5,
-    )
+    detector = make_face_detector()
 
     cap = cv2.VideoCapture(camera_index)
     if not cap.isOpened():
@@ -90,7 +103,7 @@ def main(camera_index=0):
 
     show_mesh = True
     feature_buffer = deque(maxlen=SEQUENCE_LENGTH)
-    last_valid = [0.0] * NUM_FEATURES
+    last_valid = [0.0] * 5  # raw features only (EAR, MAR, yaw, pitch, roll)
     alert_system = AlertSystem()  # turns predictions into spoken alarms
 
     print("Camera opened. Press 'q' or ESC to quit, 'm' to toggle the mesh.")
@@ -105,26 +118,22 @@ def main(camera_index=0):
         frame = cv2.flip(frame, 1)  # mirror, feels natural
         h, w, _ = frame.shape
         rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
-        results = face_mesh.process(rgb)
+        mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+        result = detector.detect(mp_image)
 
         ear_text, mar_text = "EAR: --", "MAR: --"
         pose_text = "yaw/pitch/roll: --"
 
-        if results.multi_face_landmarks:
-            face_landmarks = results.multi_face_landmarks[0]
+        if result.face_landmarks:
+            face_landmarks = result.face_landmarks[0]
 
             if show_mesh:
-                mp_draw.draw_landmarks(
-                    image=frame,
-                    landmark_list=face_landmarks,
-                    connections=mp_face_mesh.FACEMESH_TESSELATION,
-                    landmark_drawing_spec=None,
-                    connection_drawing_spec=mp_styles
-                    .get_default_face_mesh_tesselation_style(),
-                )
+                for lm in face_landmarks:
+                    cv2.circle(frame, (int(lm.x * w), int(lm.y * h)),
+                               1, (80, 80, 80), -1)
 
             for idx in RIGHT_EYE_INDICES + LEFT_EYE_INDICES + MOUTH_INDICES:
-                lm = face_landmarks.landmark[idx]
+                lm = face_landmarks[idx]
                 cv2.circle(frame, (int(lm.x * w), int(lm.y * h)), 2,
                            (0, 255, 0), -1)
 
@@ -144,13 +153,16 @@ def main(camera_index=0):
 
         # Predict once the buffer is full.
         if len(feature_buffer) == SEQUENCE_LENGTH:
-            x = torch.tensor([list(feature_buffer)],
-                             dtype=torch.float32, device=device)  # (1, 30, 5)
+            buf = np.array(list(feature_buffer))               # (60, 5)
+            delta = np.zeros((len(buf), 2), dtype=np.float32)
+            delta[1:] = buf[1:, :2] - buf[:-1, :2]
+            buf_full = np.concatenate([buf, delta], axis=1)   # (60, 7)
+            x = torch.tensor([buf_full], dtype=torch.float32, device=device)
             with torch.no_grad():
                 logits = model(x)
                 probs = F.softmax(logits, dim=1)[0].cpu().numpy()
             top = int(probs.argmax())
-            label = CLASSES[top]
+            label = class_names[top]
             conf = float(probs[top])
 
             # run the alarm rules on this prediction (plays sound if needed)
@@ -172,7 +184,7 @@ def main(camera_index=0):
             bar_max_w = 220
             x0 = w - bar_max_w - 20
             y0 = 20
-            for i, name in enumerate(CLASSES):
+            for i, name in enumerate(class_names):
                 p = float(probs[i])
                 y = y0 + i * (bar_h + 4)
                 cv2.rectangle(frame, (x0, y), (x0 + bar_max_w, y + bar_h),
@@ -206,7 +218,7 @@ def main(camera_index=0):
             show_mesh = not show_mesh
 
     cap.release()
-    face_mesh.close()
+    detector.close()
     cv2.destroyAllWindows()
 
 
