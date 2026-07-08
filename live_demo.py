@@ -11,6 +11,7 @@ Controls:
 Run:
     python live_demo.py
 """
+import argparse
 import os
 import sys
 from collections import deque
@@ -34,16 +35,17 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 from config import (RIGHT_EYE_INDICES, LEFT_EYE_INDICES, MOUTH_INDICES,
                     SEQUENCE_LENGTH, CLASSES, MODELS_DIR)
 from features import compute_ear_mar, compute_head_pose, make_face_detector
-from model import DrowsinessLSTM, DrowsinessTCN
+from model import DrowsinessLSTM
 from alerts import AlertSystem
+
 
 
 def load_model(device):
     """Load best_model.pth. Returns (model, class_names).
 
     Handles two checkpoint formats:
-    - New (dict):  {"model_type": "lstm"|"tcn", "state_dict": ..., "class_names": [...], ...}
-    - Legacy (bare state_dict): old LSTM checkpoints saved before the --model flag.
+    - New (dict):  {"model_type": "lstm", "state_dict": ..., "class_names": [...], ...}
+    - Legacy (bare state_dict): old LSTM checkpoints saved before the dict format.
     """
     weights_path = MODELS_DIR / "best_model.pth"
     if not weights_path.exists():
@@ -61,13 +63,10 @@ def load_model(device):
         num_classes = len(class_names)
         num_features = raw.get("num_features", 7)  # default 7 for older checkpoints
 
-        if model_type == "tcn":
-            model = DrowsinessTCN(input_size=num_features, num_classes=num_classes).to(device)
-        else:
-            hidden_size = raw.get("hidden_size", 128)
-            num_layers = raw.get("num_layers", 2)
-            model = DrowsinessLSTM(input_size=num_features, hidden_size=hidden_size,
-                                   num_layers=num_layers, num_classes=num_classes).to(device)
+        hidden_size = raw.get("hidden_size", 128)
+        num_layers = raw.get("num_layers", 2)
+        model = DrowsinessLSTM(input_size=num_features, hidden_size=hidden_size,
+                               num_layers=num_layers, num_classes=num_classes).to(device)
     else:
         # Legacy bare state_dict — infer LSTM config from weight shapes
         state = raw
@@ -90,21 +89,49 @@ def load_model(device):
     return model, class_names
 
 
-def main(camera_index=0):
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--camera", type=int, default=0)
+    args = parser.parse_args()
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
     model, class_names = load_model(device)
 
     detector = make_face_detector()
 
-    cap = cv2.VideoCapture(camera_index)
+    cap = cv2.VideoCapture(args.camera)
     if not cap.isOpened():
-        raise IOError(f"Could not open camera index {camera_index}")
+        raise IOError(f"Could not open camera index {args.camera}")
 
     show_mesh = True
+
+    # Rolling feature buffer — holds the last SEQUENCE_LENGTH frames.
+    # Once full, its contents are fed to the model as one prediction window.
     feature_buffer = deque(maxlen=SEQUENCE_LENGTH)
-    last_valid = [0.0] * 5  # raw features only (EAR, MAR, yaw, pitch, roll)
-    alert_system = AlertSystem()  # turns predictions into spoken alarms
+
+    # Probability smoothing — average the last 45 raw prediction vectors
+    # so single-frame noise doesn't flip the displayed label.
+    pred_buffer = deque(maxlen=45)
+
+    # EAR smoothing — average the last 5 EAR values to absorb normal blinks,
+    # which would otherwise briefly spike the feature and confuse the model.
+    ear_history = deque(maxlen=5)
+
+    # Forward-fill: when no face is detected we reuse the previous frame's
+    # features so the buffer keeps advancing in real time.
+    last_valid = [0.0] * 5
+
+    alert_system = AlertSystem()  # plays spoken alarms when drowsiness persists
+
+    # Hysteresis state — prevents rapid flipping between labels.
+    # A new label must win SWITCH_FRAMES consecutive frames before we commit to it.
+    stable_label = None
+    stable_conf = 0.0
+    candidate_label = None   # label currently being "auditioned"
+    candidate_frames = 0     # how many frames in a row the candidate has won
+    SWITCH_FRAMES = 30
+    DROWSY_MIN_PROB = 0.70   # Drowsy must reach 70% averaged confidence to trigger
 
     print("Camera opened. Press 'q' or ESC to quit, 'm' to toggle the mesh.")
     print(f"Need {SEQUENCE_LENGTH} frames before predictions start...")
@@ -124,6 +151,11 @@ def main(camera_index=0):
         ear_text, mar_text = "EAR: --", "MAR: --"
         pose_text = "yaw/pitch/roll: --"
 
+        # --- Feature extraction ------------------------------------------
+        # MediaPipe gives us 478 face landmarks; we compute three things:
+        #   EAR  — Eye Aspect Ratio: drops when eyes close (drowsiness signal)
+        #   MAR  — Mouth Aspect Ratio: rises when mouth opens (yawn signal)
+        #   yaw/pitch/roll — head orientation (catches head nodding / tilting)
         if result.face_landmarks:
             face_landmarks = result.face_landmarks[0]
 
@@ -139,33 +171,81 @@ def main(camera_index=0):
 
             ear, mar = compute_ear_mar(face_landmarks, w, h)
             yaw, pitch, roll = compute_head_pose(face_landmarks, w, h)
-            last_valid = [ear, mar, yaw, pitch, roll]
-            ear_text = f"EAR: {ear:.3f}"
+            ear_history.append(ear)
+            smoothed_ear = float(np.mean(ear_history))
+            last_valid = [smoothed_ear, mar, yaw, pitch, roll]
+            ear_text = f"EAR: {smoothed_ear:.3f}"
             mar_text = f"MAR: {mar:.3f}"
             pose_text = f"yaw {yaw:+.2f}  pitch {pitch:+.2f}  roll {roll:+.2f}"
         else:
             cv2.putText(frame, "No face detected", (20, 40),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 0, 255), 2)
 
-        # always feed a frame so the buffer stays in real time (forward-fill
-        # mirrors what preprocessing does on missed detections)
+        # Always push a frame (forward-fill when face is missing) so the
+        # buffer tracks real time and predictions stay in sync with the video.
         feature_buffer.append(list(last_valid))
 
-        # Predict once the buffer is full.
+        # --- Model inference ---------------------------------------------
+        # Wait until we have a full window of SEQUENCE_LENGTH frames, then
+        # build the 7-feature input (5 raw + 2 frame-to-frame deltas) and
+        # run the LSTM.
         if len(feature_buffer) == SEQUENCE_LENGTH:
             buf = np.array(list(feature_buffer))               # (60, 5)
             delta = np.zeros((len(buf), 2), dtype=np.float32)
-            delta[1:] = buf[1:, :2] - buf[:-1, :2]
-            buf_full = np.concatenate([buf, delta], axis=1)   # (60, 7)
+            delta[1:] = buf[1:, :2] - buf[:-1, :2]            # Δ_EAR, Δ_MAR
+            buf_full = np.concatenate([buf, delta], axis=1)    # (60, 7)
             x = torch.tensor([buf_full], dtype=torch.float32, device=device)
             with torch.no_grad():
                 logits = model(x)
                 probs = F.softmax(logits, dim=1)[0].cpu().numpy()
-            top = int(probs.argmax())
-            label = class_names[top]
-            conf = float(probs[top])
 
-            # run the alarm rules on this prediction (plays sound if needed)
+            # --- Probability smoothing -----------------------------------
+            # Average the last 45 prediction vectors before deciding the label.
+            pred_buffer.append(probs)
+            avg_probs = np.mean(list(pred_buffer), axis=0)
+
+            # --- Drowsy confidence threshold -----------------------------
+            # Only classify as Drowsy when its averaged probability clears
+            # DROWSY_MIN_PROB; otherwise treat the frame as Alert to reduce
+            # false alarms caused by the model's residual Drowsy bias.
+            raw_idx = int(avg_probs.argmax())
+            if (class_names[raw_idx] == "Drowsy"
+                    and avg_probs[raw_idx] < DROWSY_MIN_PROB
+                    and "Alert" in class_names):
+                top_idx = class_names.index("Alert")
+            else:
+                top_idx = raw_idx
+            top_label = class_names[top_idx]
+            top_conf = float(avg_probs[top_idx])
+
+            # --- Hysteresis ----------------------------------------------
+            # The displayed label (stable_label) only changes once a new
+            # label has been the top prediction for SWITCH_FRAMES frames in
+            # a row.  Single-frame blips never reach the screen.
+            if stable_label is None:
+                stable_label = top_label
+                stable_conf = top_conf
+            elif top_label != stable_label:
+                if top_label == candidate_label:
+                    candidate_frames += 1
+                else:
+                    candidate_label = top_label
+                    candidate_frames = 1
+                if candidate_frames >= SWITCH_FRAMES:
+                    stable_label = candidate_label
+                    stable_conf = top_conf
+                    candidate_label = None
+                    candidate_frames = 0
+            else:
+                stable_conf = top_conf
+                candidate_label = None
+                candidate_frames = 0
+            label = stable_label
+            conf = stable_conf
+
+            # --- Alert system --------------------------------------------
+            # Passes the stable label to AlertSystem; it plays a sound when
+            # drowsiness has persisted long enough to trigger an alarm.
             banner = alert_system.update(label)
             if banner:
                 cv2.rectangle(frame, (0, 85), (w, 130), (0, 0, 255), -1)
@@ -185,13 +265,13 @@ def main(camera_index=0):
             x0 = w - bar_max_w - 20
             y0 = 20
             for i, name in enumerate(class_names):
-                p = float(probs[i])
+                p = float(avg_probs[i])
                 y = y0 + i * (bar_h + 4)
                 cv2.rectangle(frame, (x0, y), (x0 + bar_max_w, y + bar_h),
                               (50, 50, 50), -1)
                 cv2.rectangle(frame, (x0, y),
                               (x0 + int(bar_max_w * p), y + bar_h),
-                              (0, 200, 0) if i == top else (180, 180, 180),
+                              (0, 200, 0) if i == top_idx else (180, 180, 180),
                               -1)
                 cv2.putText(frame, f"{name} {p*100:4.0f}%",
                             (x0 + 5, y + bar_h - 4),

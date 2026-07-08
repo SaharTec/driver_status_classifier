@@ -15,8 +15,6 @@ import numpy as np
 import torch
 from torch.utils.data import Dataset, DataLoader
 
-# --- previous version (kept so we can restore the no-exclude setup) ---
-# from config import (PROCESSED_DIR, LABELS_FILE, SEQUENCE_LENGTH, NUM_FEATURES)
 from config import (PROCESSED_DIR, LABELS_FILE, SEQUENCE_LENGTH, NUM_FEATURES,
                     CLASSES, CLASS_TO_IDX, NUM_CLASSES)
 
@@ -50,10 +48,13 @@ class DrowsinessDataset(Dataset):
     def __init__(self, entries, seq_len=SEQUENCE_LENGTH, stride=1, augment=False):
         self.seq_len = seq_len
         self.augment = augment
-        self.samples = []  # list of (video_idx, start_frame)
         self.arrays = [arr for arr, _ in entries]
         self.video_labels = [lbl for _, lbl in entries]
 
+        # Sliding window: each (video_idx, start_frame) pair is one training sample.
+        # stride > 1 skips frames between windows, producing fewer but more
+        # independent samples (useful when training data is large).
+        self.samples = []
         for v_idx, arr in enumerate(self.arrays):
             last_start = arr.shape[0] - seq_len
             for start in range(0, last_start + 1, stride):
@@ -65,29 +66,24 @@ class DrowsinessDataset(Dataset):
     def __getitem__(self, idx):
         v_idx, start = self.samples[idx]
         window = self.arrays[v_idx][start:start + self.seq_len].copy()  # (seq_len, 5)
+
+        # Data augmentation: add tiny Gaussian noise during training to make
+        # the model less sensitive to small variations in feature values.
         if self.augment:
             window += np.random.normal(0, 0.01, window.shape).astype(np.float32)
+
+        # Append frame-to-frame deltas for EAR and MAR (columns 0 and 1).
+        # These capture the rate of change (e.g. how quickly eyes are closing)
+        # which the raw values alone don't convey.
         delta = np.zeros((self.seq_len, 2), dtype=np.float32)
         delta[1:] = window[1:, :2] - window[:-1, :2]
-        window = np.concatenate([window, delta], axis=1)         # (seq_len, 7)
-        x = torch.from_numpy(window)                             # (seq_len, NUM_FEATURES)
+        window = np.concatenate([window, delta], axis=1)   # (seq_len, 7)
+
+        x = torch.from_numpy(window)
         y = torch.tensor(self.video_labels[v_idx], dtype=torch.long)
         return x, y
 
 
-# --- previous version (no class filtering) -------------------------------
-# def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42):
-#     """
-#     Split videos into train/val, build sliding-window datasets and return
-#     (train_loader, val_loader).
-#     """
-#     entries = _load_entries()
-#     if not entries:
-#         raise RuntimeError("No usable videos found in data/processed.")
-#
-#     random.seed(seed)
-#     random.shuffle(entries)
-# -------------------------------------------------------------------------
 def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42,
                      exclude=None, merge=None):
     """
@@ -95,41 +91,44 @@ def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42,
     (train_loader, val_loader, class_names).
 
     `exclude`: list of class names to drop entirely (e.g. ["Sleeping"]).
-    `merge`:   (src, dst) tuple — all src videos are relabelled as dst
-               (e.g. ("Sleeping", "Drowsy")). src disappears as a separate class.
+    `merge`:   (src, dst) tuple OR list of (src, dst) tuples.
+               Each src is relabelled as dst and disappears as a separate class.
+    merge and exclude can be combined (exclude is applied on original labels).
     Labels are always remapped to a contiguous 0..K-1 range.
     """
     entries = _load_entries()
     if not entries:
         raise RuntimeError("No usable videos found in data/processed.")
 
-    if merge:
-        src_name, dst_name = merge
-        for name in (src_name, dst_name):
-            if name not in CLASS_TO_IDX:
-                raise ValueError(f"Unknown class '{name}'. Valid: {CLASSES}")
-        src_idx = CLASS_TO_IDX[src_name]
-        dst_idx = CLASS_TO_IDX[dst_name]
+    if merge or exclude:
+        # Build merge map on original label indices
         raw_map = list(range(NUM_CLASSES))
-        raw_map[src_idx] = dst_idx          # src → dst
-        remaining = sorted(set(raw_map))
-        compact = {old: new for new, old in enumerate(remaining)}
-        entries = [(arr, compact[raw_map[lbl]]) for arr, lbl in entries]
-        class_names = [CLASSES[i] for i in remaining]
-        print(f"Merging '{src_name}' -> '{dst_name}': training on {class_names}")
-    elif exclude:
-        unknown = [c for c in exclude if c not in CLASS_TO_IDX]
+        if merge:
+            pairs = [merge] if isinstance(merge[0], str) else list(merge)
+            for src_name, dst_name in pairs:
+                for name in (src_name, dst_name):
+                    if name not in CLASS_TO_IDX:
+                        raise ValueError(f"Unknown class '{name}'. Valid: {CLASSES}")
+                raw_map[CLASS_TO_IDX[src_name]] = CLASS_TO_IDX[dst_name]
+
+        # Filter excluded classes (by original label), then apply merge map
+        excluded_idx = {CLASS_TO_IDX[c] for c in (exclude or [])}
+        unknown = [c for c in (exclude or []) if c not in CLASS_TO_IDX]
         if unknown:
-            raise ValueError(f"Unknown class name(s) to exclude: {unknown}. "
-                             f"Valid classes: {CLASSES}")
-        excluded_idx = {CLASS_TO_IDX[c] for c in exclude}
-        kept_idx = [i for i in range(NUM_CLASSES) if i not in excluded_idx]
-        remap = {old: new for new, old in enumerate(kept_idx)}
-        entries = [(arr, remap[lbl]) for arr, lbl in entries if lbl not in excluded_idx]
-        class_names = [CLASSES[i] for i in kept_idx]
+            raise ValueError(f"Unknown class(es) to exclude: {unknown}. Valid: {CLASSES}")
+        entries = [(arr, raw_map[lbl]) for arr, lbl in entries if lbl not in excluded_idx]
         if not entries:
-            raise RuntimeError("No videos left after applying --exclude.")
-        print(f"Excluding {sorted(exclude)} -> training on {class_names}")
+            raise RuntimeError("No videos left after applying filters.")
+
+        # Remap to contiguous 0..K-1
+        remaining = sorted(set(lbl for _, lbl in entries))
+        compact = {old: new for new, old in enumerate(remaining)}
+        entries = [(arr, compact[lbl]) for arr, lbl in entries]
+        class_names = [CLASSES[i] for i in remaining]
+        if merge:
+            print(f"Merging {pairs} -> training on {class_names}")
+        if exclude:
+            print(f"Excluding {sorted(exclude)} -> training on {class_names}")
     else:
         class_names = list(CLASSES)
 
@@ -151,15 +150,10 @@ def make_dataloaders(batch_size=32, val_split=0.2, stride=1, seed=42,
     print(f"Videos: {len(train_entries)} train / {len(val_entries)} val")
     print(f"Windows: {len(train_ds)} train"
           + (f" / {len(val_ds)} val" if val_loader else ""))
-    # --- previous version -------------------------------------------------
-    # return train_loader, val_loader
-    # ----------------------------------------------------------------------
     return train_loader, val_loader, class_names
 
 
 if __name__ == "__main__":
-    # Quick self-test
-    # --- previous version: tr, va = make_dataloaders(batch_size=8) ---
     tr, va, names = make_dataloaders(batch_size=8)
     xb, yb = next(iter(tr))
     print("batch x:", xb.shape, "batch y:", yb.shape, "labels:", yb.tolist())

@@ -26,20 +26,9 @@ sys.path.append(os.path.join(os.path.dirname(__file__), "src"))
 
 from config import MODELS_DIR, NUM_CLASSES, NUM_FEATURES  # noqa: E402
 from dataset import make_dataloaders               # noqa: E402
-from model import DrowsinessLSTM, DrowsinessTCN    # noqa: E402
+from model import DrowsinessLSTM    # noqa: E402
 
 
-# --- previous version (hard-wired to NUM_CLASSES) ------------------------
-# def compute_class_weights(loader, device):
-#     """Inverse-frequency weights so rare classes (e.g. Sleeping) count
-#     as much as the common ones. Returns a (NUM_CLASSES,) tensor for the loss."""
-#     ds = loader.dataset
-#     labels = [ds.video_labels[v_idx] for v_idx, _ in ds.samples]
-#     counts = np.bincount(labels, minlength=NUM_CLASSES).astype(np.float64)
-#     counts = np.clip(counts, 1.0, None)            # avoid div-by-zero
-#     weights = counts.sum() / (NUM_CLASSES * counts)
-#     return torch.tensor(weights, dtype=torch.float32, device=device)
-# -------------------------------------------------------------------------
 def compute_class_weights(loader, device, num_classes=NUM_CLASSES):
     """Inverse-frequency weights so rare classes count as much as the common
     ones. Returns a (num_classes,) tensor for the loss. `num_classes` reflects
@@ -47,12 +36,18 @@ def compute_class_weights(loader, device, num_classes=NUM_CLASSES):
     ds = loader.dataset
     labels = [ds.video_labels[v_idx] for v_idx, _ in ds.samples]
     counts = np.bincount(labels, minlength=num_classes).astype(np.float64)
-    counts = np.clip(counts, 1.0, None)            # avoid div-by-zero
+    counts = np.clip(counts, 1.0, None)
     weights = counts.sum() / (num_classes * counts)
     return torch.tensor(weights, dtype=torch.float32, device=device)
 
 
 def run_epoch(model, loader, criterion, optimizer, device, train):
+    """Run one full pass over the data loader (train or eval).
+
+    In train mode: computes loss, back-propagates, and updates weights.
+    In eval mode:  computes loss and accuracy with gradients disabled.
+    Returns (avg_loss, accuracy) over the entire loader.
+    """
     model.train() if train else model.eval()
     total_loss, correct, total = 0.0, 0, 0
 
@@ -80,11 +75,9 @@ def main():
     parser.add_argument("--epochs", type=int, default=30)
     parser.add_argument("--batch-size", type=int, default=32)
     parser.add_argument("--lr", type=float, default=1e-3)
-    parser.add_argument("--model", choices=["lstm", "tcn"], default="lstm",
-                        help="model architecture: lstm (default) or tcn")
     parser.add_argument("--hidden-size", type=int, default=128)
     parser.add_argument("--num-layers", type=int, default=2,
-                        help="number of stacked LSTM layers (default 2, lstm only)")
+                        help="number of stacked LSTM layers (default 2)")
     parser.add_argument("--stride", type=int, default=1)
     parser.add_argument("--patience", type=int, default=7,
                         help="stop after this many epochs without val_loss improvement")
@@ -95,34 +88,48 @@ def main():
     parser.add_argument("--merge", nargs=2, default=None,
                         metavar=("SRC", "DST"),
                         help="merge SRC class into DST, e.g. --merge Sleeping Drowsy")
+    parser.add_argument("--binary", action="store_true",
+                        help="collapse to two classes: Alert (absorbs Singing) vs "
+                             "Drowsy (absorbs Yawning); Sleeping is excluded")
     args = parser.parse_args()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     print(f"Using device: {device}")
 
-    # --- previous version (no exclude) ----------------------------------
-    # train_loader, val_loader = make_dataloaders(
-    #     batch_size=args.batch_size, stride=args.stride)
-    #
-    # model = DrowsinessLSTM(hidden_size=args.hidden_size).to(device)
-    # class_weights = compute_class_weights(train_loader, device)
-    # --------------------------------------------------------------------
+    # --- Class setup -----------------------------------------------------
+    # --binary collapses 5 classes → 2: Alert (absorbs Singing) and
+    # Drowsy (absorbs Yawning), with Sleeping excluded entirely.
+    # This simplifies the decision boundary and improves accuracy when the
+    # goal is just "is the driver OK or not?".
+    if args.binary:
+        merge_arg = [("Singing", "Alert"), ("Yawning", "Drowsy")]
+        exclude_arg = list(args.exclude or []) + ["Sleeping"]
+    else:
+        merge_arg = tuple(args.merge) if args.merge else None
+        exclude_arg = args.exclude
+
+    # --- Dataset ---------------------------------------------------------
+    # Loads all .npy feature files, applies merge/exclude, builds
+    # sliding-window samples, and splits at the video level to avoid leakage.
     train_loader, val_loader, class_names = make_dataloaders(
         batch_size=args.batch_size, stride=args.stride,
-        exclude=args.exclude, merge=tuple(args.merge) if args.merge else None)
+        exclude=exclude_arg, merge=merge_arg)
     num_classes = len(class_names)
 
-    if args.model == "tcn":
-        model = DrowsinessTCN(num_classes=num_classes).to(device)
-    else:
-        model = DrowsinessLSTM(hidden_size=args.hidden_size,
-                               num_layers=args.num_layers,
-                               num_classes=num_classes).to(device)
-    print(f"Architecture: {args.model.upper()}")
+    # --- Model + optimiser -----------------------------------------------
+    model = DrowsinessLSTM(hidden_size=args.hidden_size,
+                           num_layers=args.num_layers,
+                           num_classes=num_classes).to(device)
+    print("Architecture: LSTM")
+
+    # Class weights make rare classes as influential as common ones during
+    # training, preventing the model from ignoring minority classes.
     class_weights = compute_class_weights(train_loader, device, num_classes)
     print("Class weights:", [round(w, 2) for w in class_weights.tolist()])
     criterion = nn.CrossEntropyLoss(weight=class_weights)
     optimizer = torch.optim.Adam(model.parameters(), lr=args.lr, weight_decay=5e-4)
+
+    # LR scheduler halves the learning rate when val_loss plateaus for 3 epochs.
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
         optimizer, mode="min", factor=0.5, patience=3, min_lr=1e-5)
 
@@ -130,7 +137,11 @@ def main():
     best_path = MODELS_DIR / "best_model.pth"
 
     history = {"train_loss": [], "train_acc": [], "val_loss": [], "val_acc": []}
-    # Early stopping tracks val_loss (the signal that actually shows overfitting).
+
+    # --- Training loop ---------------------------------------------------
+    # We track val_loss (not train_loss) because it reflects how well the
+    # model generalises.  The checkpoint with the lowest val_loss is kept;
+    # training stops early when val_loss has not improved for `patience` epochs.
     best_val_loss = float("inf")
     epochs_no_improve = 0
 
@@ -155,18 +166,17 @@ def main():
         print(msg)
         scheduler.step(current_loss)
 
-        # Save the model with the lowest val_loss, and stop once it stops
-        # improving for `patience` epochs (so we keep the best-generalizing
-        # epoch instead of the over-fitted last one).
+        # --- Checkpoint + early stopping ---------------------------------
+        # Save whenever val_loss improves; stop when it hasn't for `patience`
+        # epochs in a row (keeps the best-generalising snapshot, not the last).
         if current_loss < best_val_loss - 1e-4:
             best_val_loss = current_loss
             epochs_no_improve = 0
-            ckpt = {"model_type": args.model, "class_names": class_names,
+            ckpt = {"model_type": "lstm", "class_names": class_names,
                     "num_features": NUM_FEATURES,
+                    "hidden_size": args.hidden_size,
+                    "num_layers": args.num_layers,
                     "state_dict": model.state_dict()}
-            if args.model == "lstm":
-                ckpt.update({"hidden_size": args.hidden_size,
-                             "num_layers": args.num_layers})
             torch.save(ckpt, best_path)
             print(f"        saved (best val loss {best_val_loss:.4f})")
         else:
