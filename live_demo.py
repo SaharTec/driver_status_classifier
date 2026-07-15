@@ -131,7 +131,7 @@ def main():
     candidate_label = None   # label currently being "auditioned"
     candidate_frames = 0     # how many frames in a row the candidate has won
     SWITCH_FRAMES = 30
-    DROWSY_MIN_PROB = 0.60   # Drowsy must reach 60% averaged confidence to trigger
+    DROWSY_MIN_PROB = 0.50   # Drowsy must reach 50% averaged confidence to trigger
 
     print("Camera opened. Press 'q' or ESC to quit, 'm' to toggle the mesh.")
     print(f"Need {SEQUENCE_LENGTH} frames before predictions start...")
